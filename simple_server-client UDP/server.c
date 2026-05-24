@@ -13,7 +13,7 @@ int main(int argc, char**argv){
     if(sethandler(sigint_handler,SIGINT)<0)
     ERR("sethandler");
 
-    int fd_serv = socket(PF_INET,SOCK_DGRAM,0);
+    int fd_serv = socket(AF_INET,SOCK_DGRAM,0);
     if(fd_serv<0)
     ERR("socket");
     struct sockaddr_in serv_addr = make_address("localhost","2137");
