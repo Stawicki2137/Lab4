@@ -1,9 +1,14 @@
 #define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +18,8 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <semaphore.h>
+
 
 #ifndef TEMP_FAILURE_RETRY
 #define TEMP_FAILURE_RETRY(expression)             \
@@ -26,6 +33,32 @@
 #endif
 
 #define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
+
+int make_socket(int domain, int type)
+{
+    int sock;
+    sock = socket(domain, type, 0);
+    if (sock < 0)
+        ERR("socket");
+    return sock;
+}
+
+int bind_inet_socket(uint16_t port, int type)
+{
+    struct sockaddr_in addr;
+    int socketfd, t = 1;
+    socketfd = make_socket(PF_INET, type);
+    memset(&addr, 0, sizeof(struct sockaddr_in));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, &t, sizeof(t)))
+        ERR("setsockopt");
+    if (bind(socketfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        ERR("bind");
+
+    return socketfd;
+}
 
 int sethandler(void (*f)(int), int sigNo)
 {
