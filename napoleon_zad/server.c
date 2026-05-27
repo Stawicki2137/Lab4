@@ -49,7 +49,7 @@ void print_oddzial(int x, int y, int p, char*oddzial_name){
 void doServer(int server_fd){
 
     ssize_t buff_size = ODDZIAL_LEN + sizeof(int)*3;
-    char*recvbuff = malloc(sizeof(char)*buff_size);
+    char*recvbuff = malloc(sizeof(char)*(buff_size+1));
     if(recvbuff==NULL)
     ERR("malloc");
 
@@ -63,9 +63,10 @@ void doServer(int server_fd){
         received=TEMP_FAILURE_RETRY(recv(server_fd,recvbuff,buff_size,0));
         if(received<0)
         ERR("recv");
+        recvbuff[received]='\0';
 
         char oddzial_name[ODDZIAL_LEN+1];
-        int ret = sscanf(recvbuff,"%d %d %d %s",&x,&y,&p,oddzial_name);
+        int ret = sscanf(recvbuff,"%d %d %d %128s",&x,&y,&p,oddzial_name);
         if(ret!=4)
         {
             printf("Zły format danych: <X> <Y> <P> <nazwa oddziału> \n");
