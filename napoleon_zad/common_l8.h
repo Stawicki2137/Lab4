@@ -33,7 +33,11 @@
 #endif
 
 #define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
-
+void ms_sleep(unsigned int milli)
+{
+    struct timespec ts = {milli / 1000, (milli % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
 int make_socket(int domain, int type)
 {
     int sock;

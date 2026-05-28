@@ -4,6 +4,8 @@
 #define STACK_SIZE 16
 #define MSG_SIZE 256
 #define ADIUTANTS 4
+#define DIVISION_NAMES_SIZE 128
+#define MAP_SIZE 100
 
 typedef struct {
     char data[MSG_SIZE];
@@ -20,6 +22,79 @@ typedef struct{
 
 }report_stack_t;
 
+typedef struct{
+    char division_names[DIVISION_NAMES_SIZE][ODDZIAL_LEN+1];
+    int division_count;
+
+    pthread_mutex_t division_names_mtx;
+
+    int map[MAP_SIZE][MAP_SIZE];
+    pthread_mutex_t row_mtx[MAP_SIZE];
+}staff_state_t;
+
+typedef struct {
+    report_stack_t* stack;
+    staff_state_t* state;
+}worker_arg_t;
+
+void staff_state_init(staff_state_t* state){
+    state->division_count=0;
+
+    if(pthread_mutex_init(&state->division_names_mtx,NULL)!=0)
+    ERR("pthread_mutex_init:division_names");
+
+    for(int y=0; y<MAP_SIZE; y++){
+        if(pthread_mutex_init(&state->row_mtx[y],NULL)!=0)
+        ERR("pthread_mutex_init:row_mtx");
+
+        for(int x=0; x<MAP_SIZE; x++){
+            state->map[y][x]=-1;
+        }
+    }
+}
+int get_or_add_division_id(staff_state_t *state,const char* name){
+    
+    pthread_mutex_lock(&state->division_names_mtx);
+    for(int i=0; i<state->division_count; i++){
+        if(strcmp(name,state->division_names[i])==0)
+        {
+            pthread_mutex_unlock(&state->division_names_mtx);
+            return i; // zwracam aktualny index jesli juz jest w tablicy
+        }
+    }
+    if(state->division_count>=DIVISION_NAMES_SIZE)
+    {
+        pthread_mutex_unlock(&state->division_names_mtx);
+        return -1; // juz jest pelna tablica 
+    }
+    // jak nie ma to dokladam
+    int id = state->division_count;
+    //memcpy(state->division_names[id],name,strlen(name));   to jest ok z strlen
+    //ale lepiej podobno snprintf
+    snprintf(state->division_names[id],sizeof(state->division_names[id]),"%s",name);
+    //state->division_names[id][ODDZIAL_LEN] = '\0'; do snprintf nie trzeba tego
+    state->division_count++;
+    pthread_mutex_unlock(&state->division_names_mtx);
+    return id;
+}
+void update_map(staff_state_t * state,int division_id,int x_new,int y_new){
+    for(int i=0;i<MAP_SIZE;i++){
+        pthread_mutex_lock(&state->row_mtx[i]);
+    }
+
+    for(int y=0; y<MAP_SIZE; y++){
+        for(int x=0; x<MAP_SIZE; x++){
+            if(state->map[y][x]==division_id){
+                state->map[y][x]=-1;
+            }
+        }
+    }
+    state->map[y_new][x_new] = division_id;
+
+    for(int i=MAP_SIZE-1; i>=0; i--)
+    pthread_mutex_unlock(&state->row_mtx[i]);
+
+}
 /*
 sem_wait(sem):
     jeśli sem > 0:
@@ -51,7 +126,8 @@ void stack_push(report_stack_t* stack,const char*data,ssize_t size){
 
     pthread_mutex_unlock(&stack->mutex);
 
-    sem_post(&stack->items_sem);
+    if(sem_post(&stack->items_sem)<0)
+    ERR("sem_post:items");
 }
 void stack_pop(report_stack_t* stack,report_t* out_report){
 
@@ -102,7 +178,9 @@ void print_oddzial(int x, int y, int p, char*oddzial_name){
     }
 }
 void * adiutant_works(void* arg){
-    report_stack_t* stack = arg;
+    worker_arg_t* worker_arg = arg;
+    report_stack_t* stack = worker_arg->stack;
+    staff_state_t* staff = worker_arg->state;
 
     while(1){
         report_t report;
@@ -126,6 +204,17 @@ void * adiutant_works(void* arg){
             continue;
         }
 
+       
+
+        ms_sleep(10);
+
+        int id = get_or_add_division_id(staff,oddzial_name);
+        if(id<0){
+            printf("Brak miejsca w tablicy\n");
+            continue;
+        }
+
+        update_map(staff,id,x,y);
         print_oddzial(x, y, p, oddzial_name);
 
     }
@@ -136,11 +225,20 @@ void doServer(int server_fd){
     char recvbuff[MSG_SIZE];
     report_stack_t stack;
     stack_init(&stack);
+    staff_state_t staff;
+    staff_state_init(&staff);
+
+    worker_arg_t worker_arg;
+    worker_arg.stack = &stack;
+    worker_arg.state = &staff;
 
     pthread_t threads[ADIUTANTS];
 
+    //pthread_t napoleon_thread;
+
+
     for(int i=0; i<ADIUTANTS; i++){
-        if(pthread_create(&threads[i],NULL,adiutant_works,&stack)!=0)
+        if(pthread_create(&threads[i],NULL,adiutant_works,&worker_arg)!=0)
         ERR("pthread_create");
     }
 
