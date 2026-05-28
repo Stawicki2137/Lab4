@@ -5,7 +5,7 @@
 #define MSG_SIZE 256
 #define ADIUTANTS 4
 #define DIVISION_NAMES_SIZE 128
-#define MAP_SIZE 100
+#define MAP_SIZE 20
 
 typedef struct {
     char data[MSG_SIZE];
@@ -31,6 +31,11 @@ typedef struct{
     int map[MAP_SIZE][MAP_SIZE];
     pthread_mutex_t row_mtx[MAP_SIZE];
 }staff_state_t;
+
+typedef struct{
+    struct sockaddr_in div_addr[DIVISION_NAMES_SIZE];
+    staff_state_t * state;
+}napoleon_data_t;
 
 typedef struct {
     report_stack_t* stack;
@@ -177,6 +182,31 @@ void print_oddzial(int x, int y, int p, char*oddzial_name){
         printf("Wrogi oddział %s był widziany na pozycji (%d,%d)\n",oddzial_name,x,y);
     }
 }
+
+void * napoleon_work(void*arg){
+    napoleon_data_t* napoleon_worker_arg = arg;
+    staff_state_t* state = napoleon_worker_arg->state;
+
+    while(1){
+         ms_sleep(300);
+
+    for(int i=0;i<MAP_SIZE;i++){
+        pthread_mutex_lock(&state->row_mtx[i]);
+    }
+    
+    printf("MAP Napoleon:\n");
+    for(int y=0; y<MAP_SIZE; y++){
+        for(int x=0; x<MAP_SIZE; x++){
+            printf("%d ",state->map[y][x]);
+        }
+        printf("\n");
+    }
+
+    for(int i=MAP_SIZE-1; i>=0; i--)
+    pthread_mutex_unlock(&state->row_mtx[i]);
+    }
+    return NULL;
+}
 void * adiutant_works(void* arg){
     worker_arg_t* worker_arg = arg;
     report_stack_t* stack = worker_arg->stack;
@@ -234,14 +264,18 @@ void doServer(int server_fd){
 
     pthread_t threads[ADIUTANTS];
 
-    //pthread_t napoleon_thread;
-
+    
 
     for(int i=0; i<ADIUTANTS; i++){
         if(pthread_create(&threads[i],NULL,adiutant_works,&worker_arg)!=0)
         ERR("pthread_create");
     }
 
+    pthread_t napoleon_thread;
+    napoleon_data_t nap_data;
+    nap_data.state=&staff;
+    if(pthread_create(&napoleon_thread,NULL,napoleon_work,&nap_data)!=0)
+    ERR("pthread_create: napoleon");
     while(1){
        
         memset(recvbuff,0,MSG_SIZE);
