@@ -1,0 +1,833 @@
+Jasne. Najłatwiej zapamiętać to jako dwa osobne mechanizmy:
+
+mmap / pamięć współdzielona → komunikacja procesów na tej samej maszynie
+UDP                        → komunikacja przez sieć za pomocą datagramów
+
+1. mmap i pamięć współdzielona
+
+mmap() mapuje pewien obszar pamięci do przestrzeni adresowej procesu.
+
+Typowa sygnatura:
+
+void *mmap(
+    void *addr,
+    size_t length,
+    int prot,
+    int flags,
+    int fd,
+    off_t offset
+);
+
+Najczęściej:
+
+void *ptr = mmap(
+    NULL,
+    size,
+    PROT_READ | PROT_WRITE,
+    MAP_SHARED,
+    fd,
+    0
+);
+
+Argumenty:
+
+NULL                  → system sam wybiera adres
+size                  → rozmiar mapowanego obszaru
+PROT_READ|PROT_WRITE  → można czytać i pisać
+MAP_SHARED            → zmiany widzą inne procesy
+fd                    → plik lub obiekt pamięci współdzielonej
+0                     → offset od początku
+
+Po błędzie mmap() zwraca:
+
+MAP_FAILED
+
+czyli:
+
+if (ptr == MAP_FAILED)
+    ERR("mmap");
+
+
+---
+
+2. Dwie typowe sytuacje z mmap
+
+Sytuacja A: pamięć współdzielona między rodzicem i dziećmi po fork()
+
+Jeżeli tworzysz pamięć przed fork(), dzieci odziedziczą mapowanie.
+
+Najprościej użyć anonimowego mapowania:
+
+SharedData *data = mmap(
+    NULL,
+    sizeof(SharedData),
+    PROT_READ | PROT_WRITE,
+    MAP_SHARED | MAP_ANONYMOUS,
+    -1,
+    0
+);
+
+if (data == MAP_FAILED)
+    ERR("mmap");
+
+Potem:
+
+pid_t pid = fork();
+
+if (pid < 0)
+    ERR("fork");
+
+if (pid == 0)
+{
+    data->counter++;
+    _exit(EXIT_SUCCESS);
+}
+
+Rodzic po wait() zobaczy zmianę.
+
+Pełny przykład:
+
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct
+{
+    int counter;
+} SharedData;
+
+int main(void)
+{
+    SharedData *data = mmap(
+        NULL,
+        sizeof(SharedData),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0
+    );
+
+    if (data == MAP_FAILED)
+    {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    data->counter = 0;
+
+    pid_t pid = fork();
+
+    if (pid < 0)
+    {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0)
+    {
+        data->counter = 123;
+        _exit(EXIT_SUCCESS);
+    }
+
+    wait(NULL);
+
+    printf("counter = %d\n", data->counter);
+
+    munmap(data, sizeof(SharedData));
+    return 0;
+}
+
+Wynik:
+
+counter = 123
+
+To działa, bo użyto:
+
+MAP_SHARED
+
+Gdyby było:
+
+MAP_PRIVATE
+
+dziecko dostałoby logicznie prywatną kopię zmian i rodzic nie zobaczyłby 123.
+
+
+---
+
+Sytuacja B: niezależne programy przez shm_open()
+
+Jeżeli masz np. osobny program server i osobny client, samo anonimowe mmap() nie wystarczy. Wtedy tworzysz nazwany obiekt pamięci współdzielonej.
+
+Schemat:
+
+shm_open()
+ftruncate()
+mmap()
+
+Przykład tworzenia:
+
+int fd = shm_open(
+    "/my_shared_memory",
+    O_CREAT | O_RDWR,
+    0600
+);
+
+if (fd < 0)
+    ERR("shm_open");
+
+Ustawienie rozmiaru:
+
+if (ftruncate(fd, sizeof(SharedData)) < 0)
+    ERR("ftruncate");
+
+Mapowanie:
+
+SharedData *data = mmap(
+    NULL,
+    sizeof(SharedData),
+    PROT_READ | PROT_WRITE,
+    MAP_SHARED,
+    fd,
+    0
+);
+
+if (data == MAP_FAILED)
+    ERR("mmap");
+
+Potem można zamknąć deskryptor:
+
+close(fd);
+
+Mapowanie nadal działa. close(fd) nie usuwa pamięci i nie unieważnia mapowania.
+
+Sprzątanie:
+
+munmap(data, sizeof(SharedData));
+shm_unlink("/my_shared_memory");
+
+Różnica:
+
+close(fd)     → zamyka deskryptor procesu
+munmap()      → usuwa mapowanie z procesu
+shm_unlink()  → usuwa nazwę obiektu pamięci współdzielonej
+
+shm_unlink() działa podobnie do unlink() dla pliku: obiekt faktycznie zniknie, gdy żaden proces nie będzie już go używał.
+
+
+---
+
+3. Typowy obiekt współdzielony
+
+Na przykład:
+
+typedef struct
+{
+    int counter;
+    int is_running;
+    double result;
+
+    pthread_mutex_t mutex;
+} SharedData;
+
+Ale zwykły mutex nie wystarczy. Jeśli mutex leży w pamięci współdzielonej i mają go używać różne procesy, trzeba ustawić:
+
+PTHREAD_PROCESS_SHARED
+
+Inicjalizacja:
+
+pthread_mutexattr_t attr;
+
+pthread_mutexattr_init(&attr);
+
+pthread_mutexattr_setpshared(
+    &attr,
+    PTHREAD_PROCESS_SHARED
+);
+
+pthread_mutex_init(&data->mutex, &attr);
+
+pthread_mutexattr_destroy(&attr);
+
+Potem różne procesy mogą robić:
+
+pthread_mutex_lock(&data->mutex);
+
+data->counter++;
+
+pthread_mutex_unlock(&data->mutex);
+
+Bez synchronizacji taki kod:
+
+data->counter++;
+
+nie jest bezpieczny, ponieważ jest w praktyce:
+
+odczytaj
+zwiększ
+zapisz
+
+Dwa procesy mogą odczytać tę samą starą wartość i zgubić jedno zwiększenie.
+
+
+---
+
+4. Robust mutex
+
+Jeżeli proces umrze, trzymając mutex, zwykły mutex może pozostać zablokowany.
+
+Można ustawić:
+
+pthread_mutexattr_setrobust(
+    &attr,
+    PTHREAD_MUTEX_ROBUST
+);
+
+Przy blokowaniu:
+
+int error = pthread_mutex_lock(&data->mutex);
+
+if (error == EOWNERDEAD)
+{
+    /*
+     * Poprzedni właściciel mutexa umarł.
+     * Dane mogą wymagać naprawy.
+     */
+
+    pthread_mutex_consistent(&data->mutex);
+}
+else if (error != 0)
+{
+    errno = error;
+    ERR("pthread_mutex_lock");
+}
+
+To często pojawia się w zadaniach laboratoryjnych z pamięcią współdzieloną.
+
+
+---
+
+5. Semafor w pamięci współdzielonej
+
+Możesz również umieścić w strukturze:
+
+sem_t semaphore;
+
+Dla semafora między procesami:
+
+sem_init(&data->semaphore, 1, initial_value);
+
+Drugi argument:
+
+0 → współdzielenie między wątkami jednego procesu
+1 → współdzielenie między procesami
+
+Czyli:
+
+sem_init(&data->semaphore, 1, 0);
+
+Potem:
+
+sem_wait(&data->semaphore);
+sem_post(&data->semaphore);
+
+
+---
+
+6. Typowe błędy przy mmap
+
+Błąd 1: MAP_PRIVATE zamiast MAP_SHARED
+
+MAP_PRIVATE
+
+oznacza, że zmiany procesu nie są widoczne dla innych.
+
+Do IPC potrzebujesz:
+
+MAP_SHARED
+
+Błąd 2: brak ftruncate()
+
+Jeżeli obiekt shm_open() ma rozmiar 0, a mapujesz większy obszar, możesz dostać np. SIGBUS.
+
+Poprawny schemat:
+
+fd = shm_open(...);
+ftruncate(fd, size);
+ptr = mmap(...);
+
+Błąd 3: mutex bez PTHREAD_PROCESS_SHARED
+
+Domyślny mutex jest przeznaczony dla wątków tego samego procesu.
+
+Błąd 4: używanie wskaźników w pamięci współdzielonej
+
+Na przykład:
+
+typedef struct
+{
+    char *name;
+} SharedData;
+
+To zwykle zły pomysł.
+
+name jest adresem ważnym w przestrzeni jednego procesu. Inny proces może mieć pod tym adresem zupełnie coś innego.
+
+Lepiej:
+
+typedef struct
+{
+    char name[128];
+} SharedData;
+
+Analogicznie lista ze zwykłymi wskaźnikami nie jest automatycznie przenośna między niezależnymi procesami. Dla procesów powstałych przez fork() bywa to łatwiejsze, ale przy niezależnych mapowaniach lepiej używać offsetów zamiast surowych adresów.
+
+Błąd 5: brak sprzątania
+
+Typowa kolejność:
+
+pthread_mutex_destroy(&data->mutex);
+munmap(data, sizeof(*data));
+shm_unlink("/name");
+
+Mutex powinien niszczyć proces odpowiedzialny za utworzenie i sprzątanie pamięci, dopiero gdy inne procesy już go nie używają.
+
+
+---
+
+7. UDP — podstawowa filozofia
+
+UDP jest protokołem datagramowym.
+
+1 sendto() → 1 datagram
+1 recvfrom() → odbiór 1 datagramu
+
+Nie ma:
+
+listen()
+accept()
+połączenia jak w TCP
+gwarancji dostarczenia
+gwarancji kolejności
+
+UDP zachowuje granice wiadomości.
+
+Jeżeli klient zrobi:
+
+sendto(fd, "ABC", 3, ...);
+sendto(fd, "DEF", 3, ...);
+
+serwer odbiera dwa oddzielne datagramy:
+
+ABC
+DEF
+
+Nie dostanie "ABCDEF" w jednym recvfrom().
+
+
+---
+
+8. Typowy serwer UDP
+
+Schemat:
+
+socket()
+bind()
+recvfrom()
+sendto()
+close()
+
+Kod:
+
+int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+if (server_fd < 0)
+    ERR("socket");
+
+Adres:
+
+struct sockaddr_in server_addr;
+memset(&server_addr, 0, sizeof(server_addr));
+
+server_addr.sin_family = AF_INET;
+server_addr.sin_port = htons(4000);
+server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+Przypięcie portu:
+
+if (bind(
+        server_fd,
+        (struct sockaddr *)&server_addr,
+        sizeof(server_addr)
+    ) < 0)
+{
+    ERR("bind");
+}
+
+Odbieranie:
+
+char buffer[1024];
+
+struct sockaddr_in client_addr;
+socklen_t client_len = sizeof(client_addr);
+
+ssize_t n = recvfrom(
+    server_fd,
+    buffer,
+    sizeof(buffer),
+    0,
+    (struct sockaddr *)&client_addr,
+    &client_len
+);
+
+client_addr zawiera IP i port nadawcy.
+
+Odpowiedź:
+
+ssize_t sent = sendto(
+    server_fd,
+    response,
+    response_size,
+    0,
+    (struct sockaddr *)&client_addr,
+    client_len
+);
+
+
+---
+
+9. Typowy klient UDP
+
+Schemat:
+
+socket()
+sendto()
+recvfrom()
+close()
+
+int fd = socket(AF_INET, SOCK_DGRAM, 0);
+if (fd < 0)
+    ERR("socket");
+
+Adres serwera:
+
+struct sockaddr_in server_addr;
+memset(&server_addr, 0, sizeof(server_addr));
+
+server_addr.sin_family = AF_INET;
+server_addr.sin_port = htons(4000);
+
+if (inet_pton(
+        AF_INET,
+        "127.0.0.1",
+        &server_addr.sin_addr
+    ) != 1)
+{
+    ERR("inet_pton");
+}
+
+Wysłanie:
+
+const char *message = "hello";
+
+if (sendto(
+        fd,
+        message,
+        strlen(message),
+        0,
+        (struct sockaddr *)&server_addr,
+        sizeof(server_addr)
+    ) < 0)
+{
+    ERR("sendto");
+}
+
+Klient nie musi robić bind(). System sam przydzieli mu losowy lokalny port.
+
+
+---
+
+10. Po co bind() w UDP?
+
+bind() ustawia lokalny port.
+
+Serwer musi mieć znany port:
+
+bind(fd, ..., port 4000);
+
+Klient zwykle nie musi robić bind(), ale może, jeśli chce wysyłać z konkretnego portu:
+
+struct sockaddr_in local_addr;
+memset(&local_addr, 0, sizeof(local_addr));
+
+local_addr.sin_family = AF_INET;
+local_addr.sin_port = htons(5000);
+local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+bind(fd, (struct sockaddr *)&local_addr, sizeof(local_addr));
+
+Wtedy serwer zobaczy, że datagram przyszedł z portu 5000.
+
+
+---
+
+11. connect() dla UDP
+
+UDP może używać connect(), ale to nadal nie jest połączenie takie jak TCP.
+
+connect(
+    fd,
+    (struct sockaddr *)&server_addr,
+    sizeof(server_addr)
+);
+
+Po tym możesz robić:
+
+write(fd, buffer, size);
+read(fd, buffer, size);
+
+albo:
+
+send(fd, buffer, size, 0);
+recv(fd, buffer, size, 0);
+
+connect() w UDP:
+
+ustawia domyślny adres zdalny,
+
+filtruje datagramy od innych nadawców,
+
+pozwala używać read/write,
+
+nie daje gwarancji dostarczenia.
+
+
+
+---
+
+12. Za mały bufor UDP
+
+To bardzo ważne.
+
+Klient wysyła datagram 100-bajtowy:
+
+sendto(fd, data, 100, ...);
+
+Serwer robi:
+
+char buffer[20];
+
+recvfrom(fd, buffer, sizeof(buffer), 0, ...);
+
+Odbierze maksymalnie 20 bajtów, a pozostałe 80 bajtów tego datagramu przepadnie.
+
+Kolejny recvfrom() odbierze już następny datagram.
+
+W TCP reszta pozostałaby w strumieniu. W UDP nie.
+
+
+---
+
+13. Długość i bajty zerowe
+
+recvfrom() zwraca rzeczywistą liczbę bajtów datagramu:
+
+ssize_t n = recvfrom(...);
+
+Jeżeli wysłano:
+
+'a' 'a' 'a' 'a' + 60 × '\0'
+
+to recvfrom() zwróci:
+
+64
+
+Bajt '\0' jest normalnym bajtem. Nie kończy datagramu.
+
+Nie używaj strlen() do danych binarnych:
+
+sendto(fd, buffer, strlen(buffer), ...); // źle dla danych z zerami
+
+Podaj prawdziwy rozmiar:
+
+sendto(fd, buffer, 64, ...);
+
+
+---
+
+14. Kolejność bajtów
+
+Do liczb wysyłanych przez sieć:
+
+htons()  // 16-bit host → network
+htonl()  // 32-bit host → network
+
+ntohs()  // 16-bit network → host
+ntohl()  // 32-bit network → host
+
+Port:
+
+addr.sin_port = htons(4000);
+
+Odczyt portu:
+
+uint16_t port = ntohs(addr.sin_port);
+
+Parametr uint32_t:
+
+uint32_t network_value = htonl(value);
+
+Po odebraniu:
+
+uint32_t value = ntohl(network_value);
+
+Dla pojedynczego char nie stosujesz konwersji.
+
+
+---
+
+15. Odpowiedź na port +1
+
+Jeżeli masz odpowiedzieć na port źródłowy klienta + 1:
+
+struct sockaddr_in response_addr = client_addr;
+
+uint16_t client_port =
+    ntohs(client_addr.sin_port);
+
+response_addr.sin_port =
+    htons(client_port + 1);
+
+Jeżeli zadanie mówi o porcie serwera + 1, np. serwer działa na 4000, odpowiedź idzie na 4001:
+
+response_addr.sin_port = htons(server_port + 1);
+
+To są dwie różne interpretacje, więc trzeba dokładnie czytać treść zadania.
+
+
+---
+
+16. recvfrom() i sygnały
+
+ssize_t n = recvfrom(...);
+
+if (n < 0)
+{
+    if (errno == EINTR)
+        continue;
+
+    ERR("recvfrom");
+}
+
+EINTR oznacza, że wywołanie przerwał obsłużony sygnał.
+
+Datagram nie jest wtedy „odebrany do połowy”. Albo recvfrom() odbiera datagram, albo wraca z błędem.
+
+Przy nieblokującym sockecie:
+
+errno == EAGAIN || errno == EWOULDBLOCK
+
+oznacza:
+
+> obecnie nie ma datagramu do odebrania.
+
+
+
+
+---
+
+17. Typowe połączenie mmap + UDP
+
+Częsty schemat zadania:
+
+proces główny:
+    odbiera datagramy UDP
+    zapisuje dane/zadania do pamięci współdzielonej
+
+procesy potomne:
+    pobierają zadania z pamięci współdzielonej
+    wykonują obliczenia
+    zapisują wyniki
+
+mutex/semafor:
+    chroni wspólną kolejkę i wyniki
+
+Przykładowa struktura:
+
+#define QUEUE_SIZE 64
+
+typedef struct
+{
+    int tasks[QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} SharedQueue;
+
+Proces odbierający UDP:
+
+recvfrom(...);
+
+pthread_mutex_lock(&queue->mutex);
+
+while (queue->count == QUEUE_SIZE)
+{
+    pthread_cond_wait(
+        &queue->not_full,
+        &queue->mutex
+    );
+}
+
+queue->tasks[queue->tail] = task;
+queue->tail = (queue->tail + 1) % QUEUE_SIZE;
+queue->count++;
+
+pthread_cond_signal(&queue->not_empty);
+pthread_mutex_unlock(&queue->mutex);
+
+Proces potomny:
+
+pthread_mutex_lock(&queue->mutex);
+
+while (queue->count == 0)
+{
+    pthread_cond_wait(
+        &queue->not_empty,
+        &queue->mutex
+    );
+}
+
+int task = queue->tasks[queue->head];
+queue->head = (queue->head + 1) % QUEUE_SIZE;
+queue->count--;
+
+pthread_cond_signal(&queue->not_full);
+pthread_mutex_unlock(&queue->mutex);
+
+Wszystkie mutexy i zmienne warunkowe umieszczone w mmap muszą mieć atrybut:
+
+PTHREAD_PROCESS_SHARED
+
+Najważniejsza ściąga:
+
+mmap:
+MAP_SHARED              → zmiany widzą procesy
+MAP_ANONYMOUS           → wygodne przed fork()
+shm_open + ftruncate    → niezależne programy
+munmap                   → usuwa mapowanie
+shm_unlink               → usuwa nazwany obiekt
+PTHREAD_PROCESS_SHARED   → synchronizacja między procesami
+
+UDP:
+socket + bind            → serwer
+sendto + recvfrom        → datagramy i adresy
+1 sendto = 1 datagram
+za mały bufor = reszta datagramu przepada
+bind = lokalny port
+adres z recvfrom = adres nadawcy
+hton/ntoh = konwersja liczb i portów
